@@ -17,12 +17,11 @@ using json = nlohmann::json;
 
 int main() {
     httplib::Server svr;
-   
-
+    svr.new_task_queue = [] { return new httplib::ThreadPool(21); };
 
     svr.Post("/fill", [](const httplib::Request &req, httplib::Response &res) {
         string data_raw = req.body;
-        cout<<"Request sssss is: " << data_raw <<endl;
+        //cout<<"Request is: " << data_raw <<endl;
 
         // cout << "Raw request (hex): ";
         // for (unsigned char c : req.body) printf("%02x ", c);
@@ -35,9 +34,9 @@ int main() {
         int rating = std::stoi(data_json["rating"].get<std::string>());  //first get string version of rating from json, and then convert this string to integer using stoi()
         string comments = data_json["comments"].get<std::string>();
         
-        cout << "Name is: " << name << endl;
-        cout << "Company is: " << company << endl;
-        cout << "Rating is: " << rating << endl;
+        // cout << "Name is: " << name << endl;
+        // cout << "Company is: " << company << endl;
+        // cout << "Rating is: " << rating << endl;
 
          if(company.empty() || name.empty()){   //name and company are compulsory fields
             res.status = 500;
@@ -56,6 +55,8 @@ int main() {
             //@Doubt: ask ma'am or TAs, that is this the correct way? But first do multi-threading and then ask
             string json_str = json_data.dump(); //convert json_data to json string, using dump()
             httplib::Client db_client("localhost", 8000);   //connect to db_server as an http client
+            //db_client.set_keep_alive(false);
+            
             auto res_db = db_client.Post("/insert", json_str, "application/json");  //send POST request to db_server
 
             if(res_db && res_db -> status == 200){
@@ -73,42 +74,50 @@ int main() {
 
     svr.Get("/view_usecompany", [](const httplib::Request &req, httplib::Response &res) {
         string data = req.body;
-        cout<<"Request is: " << data <<endl;
+        //cout<<"Request is: " << data <<endl;
 
 
         string param_company = req.get_param_value("company");
-        if(param_company.empty())
+        if(param_company.empty()){
             res.set_content("Invalid parameter! Provide company-name","text/plain");
+            res.status = 500;
+        }   
         else
         {
-            cout << "Company is: " << param_company << endl;
+            //cout << "Company is: " << param_company << endl;
             std::string url = "/select_usecompany?company=" + param_company;
     
             httplib::Client db_client("localhost",8000);
             auto res_db = db_client.Get(url);
+            //db_client.set_keep_alive(false);
             
             if(res_db && res_db -> status == 200){
                 res.status = 200;
                 //res_db->body;
-                cout<<"------------Got response from Database!-----------------"<<endl;
+                //cout<<"------------Got response from Database!-----------------"<<endl;
                 json response_from_db = json::parse(res_db->body);
 
-                cout << response_from_db;
+                //cout << response_from_db;
 
-                for(auto data : response_from_db){
-                    cout << "Name: "<< data["name"] <<endl;
-                    cout << "Company: "<< data["company"] <<endl;
-                    cout << "Rating: "<< data["rating"] <<endl;
-                    cout << "Comments: "<< data["comments"] <<endl;
-                    cout << "---------------------------------------------" << endl;
-                }
+                // for(auto data : response_from_db){
+                //     cout << "Name: "<< data["name"] <<endl;
+                //     cout << "Company: "<< data["company"] <<endl;
+                //     cout << "Rating: "<< data["rating"] <<endl;
+                //     cout << "Comments: "<< data["comments"] <<endl;
+                //     cout << "---------------------------------------------" << endl;
+                // }
 
                 string response_to_client = response_from_db.dump();
                 res.set_content(response_to_client, "text/plain");
             }
+
+            else if(res_db && res_db->status == 404){
+                res.status = 404;
+                res.set_content("Data not found!", "text/plain");
+            }
             else{
                 res.status = 500;
-                res.set_content("Error occured while inserting your feedback", "text/plain");
+                res.set_content("Error occured!", "text/plain");
             }
         }
                 
@@ -116,42 +125,49 @@ int main() {
 
     svr.Get("/view_usename", [](const httplib::Request &req, httplib::Response &res) {
         string data = req.body;
-        cout<<"Request is: " << data <<endl;
+        //cout<<"Request is: " << data <<endl;
 
         string param_name = req.get_param_value("name");
-        if(param_name.empty())
+        if(param_name.empty()){
             res.set_content("Invalid parameter!","text/plain");
+            res.status = 500;
+        }        
         else
         {
-            cout << "Name is: " << param_name << endl;
+            //cout << "Name is: " << param_name << endl;
 
             std::string url = "/select_usename?name=" + param_name;
     
             httplib::Client db_client("localhost",8000);
+            //db_client.set_keep_alive(false);
             auto res_db = db_client.Get(url);
             
             if(res_db && res_db -> status == 200){
                 res.status = 200;
                 //res_db->body;
-                cout<<"------------Got response from Database!-----------------"<<endl;
+                //cout<<"------------Got response from Database!-----------------"<<endl;
                 json response_from_db = json::parse(res_db->body);
 
-                cout << response_from_db;
+                //cout << response_from_db;
 
-                for(auto data : response_from_db){
-                    cout << "Name: "<< data["name"] <<endl;
-                    cout << "Company: "<< data["company"] <<endl;
-                    cout << "Rating: "<< data["rating"] <<endl;
-                    cout << "Comments: "<< data["comments"] <<endl;
-                    cout << "---------------------------------------------" << endl;
-                }
+                // for(auto data : response_from_db){
+                //     cout << "Name: "<< data["name"] <<endl;
+                //     cout << "Company: "<< data["company"] <<endl;
+                //     cout << "Rating: "<< data["rating"] <<endl;
+                //     cout << "Comments: "<< data["comments"] <<endl;
+                //     cout << "---------------------------------------------" << endl;
+                // }
 
                 string response_to_client = response_from_db.dump();
                 res.set_content(response_to_client, "text/plain");
             }
+            else if(res_db && res_db->status == 404){
+                res.status = 404;
+                res.set_content("Data not found!", "text/plain");
+            }
             else{
                 res.status = 500;
-                res.set_content("Error occured while inserting your feedback", "text/plain");
+                res.set_content("Error occured!", "text/plain");
             }
         }
         
@@ -159,7 +175,7 @@ int main() {
 
     svr.Delete("/delete_feedback", [](const httplib::Request &req, httplib::Response &res) {
         string data = req.body;
-        cout<<"Request is: " << data <<endl;
+        //cout<<"Request is: " << data <<endl;
 
         string param_name = req.get_param_value("name");
         string param_company = req.get_param_value("company");
@@ -167,22 +183,23 @@ int main() {
             res.set_content("Invalid parameter!","text/plain");
         else
         {
-            cout << "Name is: " << param_name << endl;
-            cout << "Company is: " << param_company << endl;
+            // cout << "Name is: " << param_name << endl;
+            // cout << "Company is: " << param_company << endl;
 
             std::string url = "/delete_row?name=" + param_name + "&company=" + param_company;
     
             httplib::Client db_client("localhost",8000);
+            //db_client.set_keep_alive(false);
             auto res_db = db_client.Delete(url);
             
             if(res_db && res_db -> status == 200){
                 res.status = 200;
-                cout<<"------------Got response from Database!-----------------"<<endl;
+                //cout<<"------------Got response from Database!-----------------"<<endl;
                 res.set_content(res_db->body, "text/plain");
             }
             else{
                 res.status = 500;
-                res.set_content("Error occured while inserting your feedback", "text/plain");
+                res.set_content("Error occured while deleting your feedback", "text/plain");
             }
         }
         

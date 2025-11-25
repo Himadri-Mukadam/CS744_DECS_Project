@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <limits>
+#include <shared_mutex>
 
 using namespace std;
 using namespace mysqlx;
@@ -15,7 +16,7 @@ using json = nlohmann::json;
 using namespace std::chrono;
 
 
-
+//Class for in-memory cache
 class TimeBasedLRUCache {
 private:
     struct Entry {
@@ -23,11 +24,14 @@ private:
         time_point<steady_clock> last_access;
     };
 
-    unordered_map<std::string, Entry> cache;
-    int capacity;
+    std::shared_mutex cache_mutex;
+    unordered_map<std::string, Entry> cache;    //string is key (user name or company name). Entry stores value and timestamp
+    int capacity;   //What is capacity of cache
 
 public:
+    //constructor that sets size of my cache
     TimeBasedLRUCache(int cap) : capacity(cap) {}
+
 
     bool exists(const std::string &key) {
         auto it = cache.find(key);
@@ -37,23 +41,28 @@ public:
         return true;
     }
 
+
     std::string get(const std::string &key) {
+
+        std::shared_lock lock(cache_mutex);
+
         if (!exists(key)) return "";
         else{
-            cout << "Came to cache and found the entry for: "<< key << endl;
+            //cout << "Came to cache and found the entry for: "<< key << endl;
             return cache[key].value;
         }
         
     }
 
     void put(const std::string &key, const std::string &value) {
-        //auto now = steady_clock::now();
 
-        // Update existing key
+        std::unique_lock lock(cache_mutex);
+
+        // Update existing key (writing in the cache)
         if (cache.find(key) != cache.end()) {
             cache[key].value = value;
             cache[key].last_access = steady_clock::now();
-            cout << "Updated in cache" << endl;
+            //cout << "Updated in cache" << endl;
             return;
         }
 
@@ -61,30 +70,36 @@ public:
         if ((int)cache.size() >= capacity) {
             std::string oldest_key;
             auto oldest_time = time_point<steady_clock>::max();
-            for (auto &p : cache) { //finding max
+            for (auto &p : cache) { //finding oldest timestamp (smaller the timestamp, older the value)
                 if (p.second.last_access < oldest_time) {
                     oldest_time = p.second.last_access;
                     oldest_key = p.first;
                 }
             }
-            cout << "Evicted (least recently used): " << oldest_key << endl;
+            //cout << "Evicted (least recently used): " << oldest_key << endl;
             cache.erase(oldest_key);
         }
 
         // Insert new entry
         cache[key] = {value, steady_clock::now()};
-        cout << "Placed in cache" << endl;
+        //cout << "Placed in cache" << endl;
 
-        cout << "===============Cache scenario: ====================" << endl;
-        print_cache();
+        //cout << "===============Cache scenario: ====================" << endl;
+        //print_cache();
+
+        return;
     }
 
     void delete_entry(const std::string &key){
-        cache.erase(key);
-        cout << "Deleted entry from cache" << endl;
 
-        cout << "===============Cache scenario: ====================" << endl;
-        print_cache();
+        std::unique_lock lock(cache_mutex);
+
+        if(exists(key)){
+            cache.erase(key);
+            //cout << "Deleted entry from cache" << endl;
+        }
+        // cout << "===============Cache scenario: ====================" << endl;
+        // print_cache();
     }
 
     void print_cache(){
@@ -98,13 +113,16 @@ public:
                 cout << "Key: " << p.first << endl;
                 cout << "Value: " << p.second.value << endl;
                 cout << "Time-stamp: " << ms << endl;
+                cout << "-----------------------" << endl;
             }
         }
+
+        return;
     }
 
 };
 
-
+std::shared_mutex database_mutex;
 
 int main() {
 
@@ -112,19 +130,22 @@ int main() {
     char name[50], company[50];
     std::string comments;
 
-    TimeBasedLRUCache Cache = TimeBasedLRUCache(5);
+    TimeBasedLRUCache Cache = TimeBasedLRUCache(50);
 
     httplib::Server svr;
+    svr.new_task_queue = [] { return new httplib::ThreadPool(32); };
 
-    //------------------connect to DB -----------------------------------
-    Session sess("localhost", 33060, "rani", "rani");
-    Schema db = sess.getSchema("feedback_db");  //database
-    Table feedback = db.getTable("feedback_form");  //table
-
+   
     //----------------Start getting requests from http-server-------------------
 
     svr.Post("/insert", [&](const httplib::Request &req, httplib::Response &res) {
         try{
+
+            //------------------connect to DB -----------------------------------
+            Session sess("localhost", 33060, "rani", "rani");
+            Schema db = sess.getSchema("feedback_db");  //database
+            Table feedback = db.getTable("feedback_form");  //table
+            
             json data = json::parse(req.body);
 
             std::string name = data["name"];
@@ -132,18 +153,21 @@ int main() {
             int rating = std::stoi(data["rating"].get<std::string>());  //first get string version of rating from json, and then convert this string to integer using stoi()
             std::string comments = data["comments"];
 
-            feedback.insert("user_name", "company_name", "rating", "comments")
+            //lock entire database for insert operation
+            {
+                //std::unique_lock lock(database_mutex);
+
+                feedback.insert("user_name", "company_name", "rating", "comments")
                     .values(name, company, rating, comments)
                     .execute();
+            }
+            
             res.status = 200;
             res.set_content("{\"status\":\"success\"}", "application/json");
 
-            if(Cache.exists(name)){
-                Cache.delete_entry(name);
-            }
-            if(Cache.exists(company)){
-                Cache.delete_entry(company);
-            }
+            //delete this key from cache
+            Cache.delete_entry(name);
+            Cache.delete_entry(company);
 
         } catch (std::exception &e) {
             printf("Error: %s\n", e.what());
@@ -156,46 +180,74 @@ int main() {
     });
         
     svr.Get("/select_usecompany", [&](const httplib::Request &req, httplib::Response &res) {
-        cout<<"Came to select_usecompany"<<endl;
+        
+            //cout<<"Came to select_usecompany"<<endl;
+           
         
             std::string company = req.get_param_value("company");
 
             //Find in the cache first
-            if(Cache.exists(company)){
+            std::string res_from_cache = Cache.get(company);
+            if(!res_from_cache.empty()){
+                // to -remove 
+                //cout << "cache search" <<endl;
                 res.status = 200;
-                res.set_content(Cache.get(company), "application/json");
+                res.set_content(res_from_cache, "application/json");
             }
 
             else{   //Else go search in the database
+                //cout<<"Came to Database" << endl;
                 json result_array = json::array();
                 try{
-                    RowResult rows = feedback
-                    .select("user_name", "company_name", "rating", "comments", "submitted_at")
-                    .where("company_name = :c")     
-                    .bind("c", company)             
-                    .execute();
 
-                    cout<<"executed line after select"<< endl;
-                    for(Row row: rows){ //get each value from one row, and push it in json array
-                        cout << row[0].get<std::string>() << endl;
-                        cout << row[1].get<std::string>() << endl;
-                        cout << std::to_string(row[2].get<int>()) << endl;
-                        cout << row[3].get<std::string>() << endl;
+                    //------------------connect to DB -----------------------------------
+                    Session sess("localhost", 33060, "rani", "rani");
+                    Schema db = sess.getSchema("feedback_db");  //database
+                    Table feedback = db.getTable("feedback_form");  //table
 
-                        json r;
-                        r["name"] = row[0].get<std::string>();
-                        r["company"] = row[1].get<std::string>();
-                        r["rating"] = std::to_string(row[2].get<int>());    //converted rating to string
-                        r["comments"] = row[3].get<std::string>();
+                    RowResult rows; 
+                    
+                    //put lock on DB
+                    {   
+                        //std::shared_lock lock(database_mutex);
+                        rows = feedback
+                                .select("user_name", "company_name", "rating", "comments", "submitted_at")
+                                .where("company_name = :c")     
+                                .bind("c", company)             
+                                .execute();
 
-                        result_array.push_back(r);
                     }
 
-                    res.status = 200;
-                    res.set_content(result_array.dump(), "application/json");
+                    if(rows.count() <= 0){
+                        res.status = 404;
+                        json empty_resp = {{ "error", "Row not found" }};
+                        res.set_content(empty_resp.dump(), "application/json");
+                    }
 
-                    //Populate the Cache
-                    Cache.put(company, result_array.dump());
+                    else{
+                        //cout<<"executed line after select"<< endl;
+                         for(Row row: rows){ //get each value from one row, and push it in json array
+                            // cout << row[0].get<std::string>() << endl;
+                            // cout << row[1].get<std::string>() << endl;
+                            // cout << std::to_string(row[2].get<int>()) << endl;
+                            // cout << row[3].get<std::string>() << endl;
+
+                            json r;
+                            r["name"] = row[0].get<std::string>();
+                            r["company"] = row[1].get<std::string>();
+                            r["rating"] = std::to_string(row[2].get<int>());    //converted rating to string
+                            r["comments"] = row[3].get<std::string>();
+
+                            result_array.push_back(r);
+                        }
+
+                        res.status = 200;
+                        res.set_content(result_array.dump(), "application/json");
+
+                        //Populate the Cache
+                        Cache.put(company, result_array.dump());
+                    }
+                    
 
                 } catch (std::exception &e) {
 
@@ -209,47 +261,70 @@ int main() {
     });
 
      svr.Get("/select_usename", [&](const httplib::Request &req, httplib::Response &res) {
-        cout<<"Came to select_usename"<<endl;
-        
+            //cout<<"Came to select_usename"<<endl;
             
             std::string name = req.get_param_value("name");
 
-            if(Cache.exists(name)){
+            //First find in the cache
+            std::string res_from_cache = Cache.get(name);
+            if(!res_from_cache.empty()){
+                //cout << "Cache search" << endl;
                 res.status = 200;
-                res.set_content(Cache.get(name), "application/json");
+                res.set_content(res_from_cache, "application/json");
             }
             
             else{
+                //cout << "Disk search" << endl;
+
                 try{
                     json result_array = json::array();
-                    RowResult rows = feedback
-                    .select("user_name", "company_name", "rating", "comments", "submitted_at")
-                    .where("user_name = :u")     
-                    .bind("u", name)            
-                    .execute();
+                    RowResult rows;
 
-                    cout<<"executed line after select"<< endl;
-
-                    for(Row row: rows){ //get each value from one row, and push it in json array
-                        cout << row[0].get<std::string>() << endl;
-                        cout << row[1].get<std::string>() << endl;
-                        cout << std::to_string(row[2].get<int>()) << endl;
-                        cout << row[3].get<std::string>() << endl;
-
-                        json r;
-                        r["name"] = row[0].get<std::string>();
-                        r["company"] = row[1].get<std::string>();
-                        r["rating"] = std::to_string(row[2].get<int>());    //converted rating to string
-                        r["comments"] = row[3].get<std::string>();
-
-                        result_array.push_back(r);
+                    //------------------connect to DB -----------------------------------
+                    Session sess("localhost", 33060, "rani", "rani");
+                    Schema db = sess.getSchema("feedback_db");  //database
+                    Table feedback = db.getTable("feedback_form");  //table
+                    
+                    //lock on DB
+                    {
+                        //std::shared_lock lock(database_mutex);
+                        rows  = feedback
+                            .select("user_name", "company_name", "rating", "comments", "submitted_at")
+                            .where("user_name = :u")     
+                            .bind("u", name)            
+                            .execute();
                     }
 
-                    res.status = 200;
-                    res.set_content(result_array.dump(), "application/json");
+                    if(rows.count() <= 0){
+                        res.status = 404;
+                        json empty_resp = {{ "error", "Row not found" }};
+                        res.set_content(empty_resp.dump(), "application/json");
+                    }
+                    else{
+                        //cout<<"executed line after select"<< endl;
 
-                    //Populate the Cache
-                    Cache.put(name, result_array.dump());
+                        for(Row row: rows){ //get each value from one row, and push it in json array
+                            // cout << row[0].get<std::string>() << endl;
+                            // cout << row[1].get<std::string>() << endl;
+                            // cout << std::to_string(row[2].get<int>()) << endl;
+                            // cout << row[3].get<std::string>() << endl;
+
+                            json r;
+                            r["name"] = row[0].get<std::string>();
+                            r["company"] = row[1].get<std::string>();
+                            r["rating"] = std::to_string(row[2].get<int>());    //converted rating to string
+                            r["comments"] = row[3].get<std::string>();
+
+                            result_array.push_back(r);
+                        }
+
+                        res.status = 200;
+                        res.set_content(result_array.dump(), "application/json");
+
+                        //Populate the Cache
+                        Cache.put(name, result_array.dump());
+                    }
+                    
             
                 } catch (std::exception &e) {
                     cout<<"Error: "<<e.what()<<endl;
@@ -257,14 +332,18 @@ int main() {
                     res.status = 500;
                     res.set_content(err.dump(), "application/json");
                 }
-            }
-            
-        
+            }    
 
     });
 
      svr.Delete("/delete_row", [&](const httplib::Request &req, httplib::Response &res) {
         
+        try{
+
+        
+        Session sess("localhost", 33060, "rani", "rani");
+        Schema db = sess.getSchema("feedback_db");  //database
+        Table feedback = db.getTable("feedback_form");  //table
         std::string name = req.get_param_value("name");
         std::string company = req.get_param_value("company");
 
@@ -274,17 +353,23 @@ int main() {
         }      
         else
         {
-            cout << "Name is: " << name << endl;
-            cout << "Company is: " << company << endl;
+            // cout << "Name is: " << name << endl;
+            // cout << "Company is: " << company << endl;
 
-            mysqlx::Result result = feedback
-            .remove()
-            .where("user_name = :u AND company_name = :c")
-            .bind("u", name)
-            .bind("c", company)
-            .execute();
+            mysqlx::Result result;
 
-            cout<<"No. of rows deleted : " << result.getAffectedItemsCount() << endl;
+            //lock 
+            {
+                //std::unique_lock lock(database_mutex);
+                result = feedback
+                            .remove()
+                            .where("user_name = :u AND company_name = :c")
+                            .bind("u", name)
+                            .bind("c", company)
+                            .execute();
+            } 
+
+            //cout<<"No. of rows deleted : " << result.getAffectedItemsCount() << endl;
 
             if(result.getAffectedItemsCount() > 0){
 
@@ -299,13 +384,16 @@ int main() {
             res.status = 200;
 
             //Delete from cache if present
-            if(Cache.exists(name)){
-                Cache.delete_entry(name);
+            Cache.delete_entry(name);
+            Cache.delete_entry(company);
             }
+        }
 
-            if(Cache.exists(company)){
-                Cache.delete_entry(company);
-            }
+        catch (std::exception &e) {
+                    cout<<"Error: "<<e.what()<<endl;
+                    json err = {{"error", e.what()}};
+                    res.status = 500;
+                    res.set_content(err.dump(), "application/json");
         }
         
         
